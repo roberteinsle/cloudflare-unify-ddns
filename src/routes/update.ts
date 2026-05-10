@@ -17,8 +17,15 @@ export function makeUpdateHandler(config: Config) {
     const type = recordTypeFor(ip);
     log.debug(`/update called ip=${ip} type=${type}`);
 
-    // Compare against cached last IP — skip all CF calls if unchanged
-    const state = await readState(config.statePath);
+    // Compare against cached last IP — skip all CF calls if unchanged.
+    // State is a non-critical optimization: if it can't be read (e.g. volume
+    // permission issue), proceed and let the per-record CF compare handle it.
+    let state: Awaited<ReturnType<typeof readState>> = null;
+    try {
+      state = await readState(config.statePath);
+    } catch (err) {
+      log.error(`readState failed (${config.statePath}): ${err instanceof Error ? err.message : err}`);
+    }
     if (state !== null && state.lastIp === ip) {
       log.info(`IP unchanged (${ip}), responding nochg`);
       return c.text(`nochg ${ip}`);
@@ -41,11 +48,17 @@ export function makeUpdateHandler(config: Config) {
       return c.text('dnserr', 500);
     }
 
-    // Persist new IP only when all updates succeeded
-    await writeState(config.statePath, {
-      lastIp: ip,
-      updatedAt: new Date().toISOString(),
-    });
+    // Persist new IP only when all updates succeeded.
+    // Failure to persist must not break the response — losing state only
+    // costs one extra CF compare on the next call.
+    try {
+      await writeState(config.statePath, {
+        lastIp: ip,
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      log.error(`writeState failed (${config.statePath}): ${err instanceof Error ? err.message : err}`);
+    }
 
     if (changed.length > 0) {
       log.info(`Updated ${changed.length} record(s) to ${ip}`);
